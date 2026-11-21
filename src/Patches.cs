@@ -101,7 +101,13 @@ namespace UCMB
             try
             {
                 MusicBoxPlugin p = P;
-                if (p != null) p.TickFrom("PlayerCamera.Update");
+                if (p != null)
+                {
+                    p.TickFrom("PlayerCamera.Update");
+                    // 某些音源音量由 PlayerCamera.Update 设置，晚于 MusicManager.Update，
+                    // 这里再压一次，确保暂停期间不会被它们覆盖回原音量。
+                    p.MutePauseSources();
+                }
             }
             catch (Exception ex) { Log.Error("PlayerCamera.Update 后处理异常：", ex); }
         }
@@ -156,7 +162,10 @@ namespace UCMB
                 p.RegenCount++;
                 int depth = WorldGeneration.world != null ? WorldGeneration.world.biomeDepth : -1;
 
-                if (p.RegenCount == 1)
+                // 指令跳层会重建 WorldGeneration，RegenCount 会被清零；
+                // 此时必须靠 biomeDepth 判断，否则深处也会播“第一层/行动开始”那首。
+                bool shallow = depth <= 1;
+                if (shallow)
                 {
                     // 第一层：StartRun 已经播过就跳过（否则会出现两次）；
                     // 读档 / 直接进图这类没走 StartRun 的情况，这里补播第一层音乐。
@@ -172,9 +181,17 @@ namespace UCMB
                 }
 
                 // 第 2 层用 waiting_map_2，第 3 层 _3，第 4 层及以后 _4（缺失时逐级回退）
-                int variant = Mathf.Clamp(p.RegenCount - 1, 1, EventDef.Get(MusicEvent.WaitingMap).Files.Length - 1);
-                p.PlayEvent(MusicEvent.WaitingMap, variant,
-                    "第 " + p.RegenCount + " 次生成 / 第 2 层及以后（biomeDepth=" + depth + "）");
+                int variant = Mathf.Clamp(depth <= 1 ? 1 : depth - 1, 1,
+                    EventDef.Get(MusicEvent.WaitingMap).Files.Length - 1);
+                if (!p.ShouldSkipWaiting(depth))
+                {
+                    p.PlayEvent(MusicEvent.WaitingMap, variant,
+                        "第 2 层及以后（biomeDepth=" + depth + "，第 " + p.RegenCount + " 次生成）");
+                }
+                else
+                {
+                    Log.Info("RegenerateWorld：本层加载音乐刚播过，跳过（biomeDepth=" + depth + "）");
+                }
             }
             catch (Exception ex) { Log.Error("RegenerateWorld 后处理异常：", ex); }
         }
@@ -218,11 +235,20 @@ namespace UCMB
                 MusicEvent? ev = MusicBoxPlugin.EventForClip(song);
                 if (!ev.HasValue)
                 {
-                    // 未映射的原版音轨按设计原样放行；这里节流记录名称，
-                    // 便于确认玩家听到的“原版过程音乐”具体是哪一首。
-                    if (!string.IsNullOrEmpty(p.MusicBox))
+                    if (string.IsNullOrEmpty(p.MusicBox))
+                    {
                         Log.Throttled("unmapped_" + name, 10f, "原版音轨未映射（放行原版）：" + name);
-                    return true;
+                        return true;   // 选“游戏默认”，不干预
+                    }
+                    // 选了音乐盒：只有过场/结局白名单放行，其余一律压制，
+                    // 避免“猩红之地”这类场景漏出原版音乐。
+                    if (MusicBoxPlugin.IsCutsceneClip(name))
+                    {
+                        Log.Throttled("unmapped_" + name, 10f, "过场音轨放行：" + name);
+                        return true;
+                    }
+                    Log.Throttled("blocked_" + name, 10f, "压制未映射原版音乐：" + name);
+                    return false;
                 }
                 // 本层已经播过“进入地图”音乐：不要再从 PlaySong 这条路径播第二遍
                 if (ev.Value == MusicEvent.InMap && p.IsInMapTaken(MusicBoxPlugin.CurrentDepth()))
@@ -321,6 +347,13 @@ namespace UCMB
                     else if (src.isPlaying) src.volume = src.volume * m;
                 }
                 if (p.ShouldMuteVanilla()) src.volume = 0f;
+                // 暂停时只留 suspend：原版主音源直接压到 0（暂停界面盖住全屏，不需要残留 BGM）
+                if (p.IsSuspendMusicPlaying())
+                {
+                    src.volume = 0f;
+                    p.MuteLooseVanillaSources();   // caveAudio / underWaterSource / genPodSource
+                    p.MutePauseSources();          // 其它不在固定字段上的长音源
+                }
                 // 兜底：选音乐盒时，原版“循环层 BGM”一律淡出停止。
                 // 第 10/11 层等特殊场景不走 PlayLayerSong，原版可能残留一首循环 BGM，
                 // 这里按 loop 判定（过场音乐通常 loop=false，不会被误伤）。
