@@ -1,0 +1,12 @@
+obj/
+*.user
+*.suo
+.vs/
+
+# 构建产物与本地打包
+dist/
+*.zip
+
+# 音乐盒音频（第三方音乐，体积大且有版权，不入库）
+data/*/
+!data/README.md
