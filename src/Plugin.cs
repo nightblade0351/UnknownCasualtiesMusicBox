@@ -15,7 +15,7 @@ namespace UCMB
     {
         public const string PluginGuid = "com.everywhere.unknowncasualties.musicbox";
         public const string PluginName = "UnknownCasualtiesMusicBox";
-        public const string PluginVersion = "1.3.0";
+        public const string PluginVersion = "1.3.1";
         public const string CUCoreGuid = "net.cucorelib";
 
         internal const string ModIdPrefix = "ucmb.";
@@ -813,6 +813,15 @@ namespace UCMB
                 // 这样原版层 BGM 不会再插进来，同时避免同一次进图被 PlaySong / PlayLayerSong
                 // 两条路径各播一遍（后者会把前者从头打断）。
                 if (ev == MusicEvent.InMap) MarkInMapTaken(CurrentDepth());
+                if (ev == MusicEvent.WaitingMap)
+                {
+                    _lastWaitingAt = Time.unscaledTime;
+                    _lastWaitingDepth = CurrentDepth();
+                    // 给加载音乐 3 秒独占期：它先响，3 秒后才允许 in_map 接管，
+                    // 否则会出现“进入地图音乐先播、随后被加载音乐打断”。
+                    _waitingGuardUntil = Time.unscaledTime + 3f;
+                }
+                if (ev == MusicEvent.Suspend) OnEnterSuspend();
 
                 // 世界内接管：原版音乐 3 秒淡出后停止（不硬切），避免与原版层 BGM 叠加
                 if (InWorld()) FadeOutVanillaMusic();
@@ -881,6 +890,8 @@ namespace UCMB
                 PollSettings();
                 TickPendingEvent();
                 TrackWorldDwell();
+                TrackDepthChange();
+                TrackLoadingEdge();
 
 #if SELFTEST
                 DiagState();
@@ -948,6 +959,9 @@ namespace UCMB
                     _currentEvent = null;
                     Log.Info("状态结束，音乐淡出。");
                 }
+                // 暂停结束时不要硬恢复：标记淡出结束，让 MutePauseSources 把音量淡回来
+                if (!_currentEvent.HasValue || _currentEvent.Value != MusicEvent.Suspend)
+                    EndSuspend();
             }
             catch (Exception ex)
             {
@@ -1056,6 +1070,8 @@ namespace UCMB
                 if (!IsInMapTaken(depth) && !string.IsNullOrEmpty(_box)
                     && Time.unscaledTime - _inMapFailBackoff > 3f)
                 {
+                    // 加载音乐独占期内不抢：先让 waiting_map 响，再换成 in_map
+                    if (WaitingGuardActive) return null;
                     DiagInMapAttempt(depth);
                     // 等“第一层窗口”（层标题）出现后再播；地图仍在生成时不播。
                     if (IsBiomeIntroReady())
@@ -1124,6 +1140,177 @@ namespace UCMB
                 && Engine != null && Engine.IsTagPlaying(TagOf(MusicEvent.Suspend));
         }
 
+        /// <summary>暂停音乐正在播：此时主音源也必须压到 0，避免与原版残留 BGM 叠加。</summary>
+        internal bool IsSuspendMusicPlaying()
+        {
+            return _currentEvent.HasValue && _currentEvent.Value == MusicEvent.Suspend
+                && Engine != null && Engine.IsTagPlaying(TagOf(MusicEvent.Suspend));
+        }
+
+        /// <summary>
+        /// 暂停时压制“不在 drone 数组里”的原版环境音源。
+        /// 猩红之地这类场景会挂 caveAudio / underWaterSource / genPodSource 等独立音源，
+        /// 它们不受 DuckVanillaDrones 管，暂停时会和 suspend 叠在一起。
+        /// </summary>
+        internal void MuteLooseVanillaSources()
+        {
+            try
+            {
+                WorldGeneration w = WorldGeneration.world;
+                if (w != null)
+                {
+                    if (w.caveAudio != null) w.caveAudio.volume = 0f;
+                    if (w.genPodSource != null) w.genPodSource.volume = 0f;
+                }
+                PlayerCamera pc = PlayerCamera.main;
+                if (pc != null && pc.underWaterSource != null) pc.underWaterSource.volume = 0f;
+            }
+            catch (Exception ex) { Log.Warn("暂停压制环境音失败：" + ex.Message); }
+        }
+
+        // ---- 暂停期间的“全量长音源”压制 ----
+        // 有些原版音乐/环境音既不在 MusicManager.source，也不在 droneSources，
+        // 也不在 caveAudio 这些固定字段上（例如 Sound.Play 生成的音源）。
+        // 进入暂停时把场景里所有“非本模组、且时长>5秒”的音源缓存下来，逐帧压 0，
+        // 短音效（UI 点击等）不受影响。
+        private List<AudioSource> _pauseSources;
+        private float _pauseRescanAt;
+        private bool _pauseActive;
+        private float _pauseFade = 1f;
+        private bool _lastLoadingVisible;
+
+        /// <summary>
+        /// 加载界面关闭的那一刻：重置本层的 in_map 标记，确保“进入地图音乐”一定播一次。
+        /// </summary>
+        private void TrackLoadingEdge()
+        {
+            try
+            {
+                bool loading = IsLoadingScreenVisible();
+                if (_lastLoadingVisible && !loading)
+                {
+                    int d = CurrentDepth();
+                    _inMapTaken.Remove(d);
+                    _inMapFailBackoff = -999f;
+                    Log.Info("加载界面已关闭：允许 biomeDepth=" + d + " 播放进入地图音乐");
+                }
+                _lastLoadingVisible = loading;
+            }
+            catch { }
+        }
+
+        internal void OnEnterSuspend()
+        {
+            CollectPauseSources(true);
+            _pauseActive = true;
+            _pauseFade = 1f;                    // 从当前音量开始淡出，避免硬切
+            _pauseRescanAt = Time.unscaledTime + 0.5f;
+        }
+
+        /// <summary>解除暂停：不要立刻恢复原音量，先淡回来。</summary>
+        internal void EndSuspend()
+        {
+            _pauseActive = false;
+        }
+
+        private void CollectPauseSources(bool log)
+        {
+            try
+            {
+                _pauseSources = new List<AudioSource>();
+                AudioSource[] all = UnityEngine.Object.FindObjectsOfType<AudioSource>();
+                System.Text.StringBuilder sb = log ? new System.Text.StringBuilder() : null;
+                for (int i = 0; i < all.Length; i++)
+                {
+                    AudioSource s = all[i];
+                    if (s == null || s.clip == null) continue;
+                    if (s.clip.length < 1.5f) continue;    // 过滤枪声/点击等短音效
+                    if (IsOurSource(s)) continue;
+                    _pauseSources.Add(s);
+                    if (sb != null && _pauseSources.Count <= 10)
+                        sb.Append("\n    ").Append(PathOf(s.transform))
+                          .Append(" len=").Append(s.clip.length.ToString("F1"))
+                          .Append(" loop=").Append(s.loop)
+                          .Append(" vol=").Append(s.volume.ToString("F2"))
+                          .Append(" play=").Append(s.isPlaying);
+                }
+                if (log)
+                    Log.Info("暂停：已锁定 " + _pauseSources.Count + " 条原版长音源" + (sb == null ? "" : sb.ToString()));
+            }
+            catch (Exception ex) { Log.Warn("收集暂停音源失败：" + ex.Message); }
+        }
+
+        private static string PathOf(Transform t)
+        {
+            try
+            {
+                string p = t.name;
+                Transform cur = t.parent;
+                int guard = 0;
+                while (cur != null && guard++ < 6) { p = cur.name + "/" + p; cur = cur.parent; }
+                return p;
+            }
+            catch { return "?"; }
+        }
+
+        internal void MutePauseSources()
+        {
+            if (_pauseSources == null) return;
+            float dt = Time.unscaledDeltaTime;
+            float target = _pauseActive ? 0f : 1f;
+            // 1.2 秒淡出 / 1.2 秒淡入，和音乐盒自身的 1.5 秒交叉过渡接近
+            _pauseFade = Mathf.MoveTowards(_pauseFade, target, dt / 1.2f);
+            float f = Mathf.Clamp01(_pauseFade);
+
+            for (int i = 0; i < _pauseSources.Count; i++)
+            {
+                AudioSource s = _pauseSources[i];
+                if (s == null) continue;
+                if (f <= 0.002f)
+                {
+                    s.mute = true;                 // 已经完全淡出，用 mute 兜底防止被推回
+                    continue;
+                }
+                s.mute = false;
+                // 原版每帧会重设音量，这里做“乘系数”，所以不会累积衰减
+                if (s.isPlaying) s.volume = s.volume * f;
+            }
+            if (!_pauseActive && f >= 0.999f) { ClearPauseSources(); return; }
+
+            // 暂停期间可能有新音源被创建（过场/环境），定期重扫一次
+            if (Time.unscaledTime >= _pauseRescanAt)
+            {
+                _pauseRescanAt = Time.unscaledTime + 1f;
+                CollectPauseSources(false);
+            }
+        }
+
+        internal void ClearPauseSources()
+        {
+            // 解除暂停时必须恢复 mute，否则原版音乐会被永久静音
+            if (_pauseSources != null)
+            {
+                for (int i = 0; i < _pauseSources.Count; i++)
+                {
+                    AudioSource s = _pauseSources[i];
+                    if (s != null) s.mute = false;
+                }
+            }
+            _pauseSources = null;
+        }
+
+        private static bool IsOurSource(AudioSource s)
+        {
+            Transform t = s.transform;
+            int guard = 0;
+            while (t != null && guard++ < 16)
+            {
+                if (t.name.StartsWith("UC-MusicBox", StringComparison.Ordinal)) return true;
+                t = t.parent;
+            }
+            return false;
+        }
+
         private static bool InWorld()
         {
             try { return WorldGeneration.world != null && PlayerCamera.main != null; }
@@ -1169,6 +1356,73 @@ namespace UCMB
         }
 
         private float _worldSince = -1f;
+        private int _lastDepth = -1;
+        private float _lastWaitingAt = -999f;
+        private int _lastWaitingDepth = int.MinValue;
+        private float _waitingGuardUntil = -999f;
+
+        /// <summary>加载音乐刚开始播时给它一段独占期，避免 in_map 立刻抢走。</summary>
+        internal bool WaitingGuardActive
+        {
+            get { return Time.unscaledTime < _waitingGuardUntil; }
+        }
+
+        /// <summary>同一层在短时间内只播一次加载音乐（RegenerateWorld 与层变化检测互斥）。</summary>
+        internal bool ShouldSkipWaiting(int depth)
+        {
+            // 只挡“同一次切换被两条路径各播一遍”，窗口不宜过长，
+            // 否则快速连续跳层会误判成重复。
+            return _lastWaitingDepth == depth && Time.unscaledTime - _lastWaitingAt < 2.5f;
+        }
+
+        /// <summary>
+        /// 兜底层级切换检测：指令传送/开发者跳层不一定走 RegenerateWorld，
+        /// 这里直接盯 biomeDepth 变化，确保每换一层都有“加载地图界面音乐”。
+        /// </summary>
+        private void TrackDepthChange()
+        {
+            try
+            {
+                // 用 world 是否存在判断，而不是 InWorld()（后者还要求 PlayerCamera，
+                // 传送瞬间可能为空，导致漏掉一次层变化）。
+                if (WorldGeneration.world == null) { _lastDepth = -1; return; }
+                int d = CurrentDepth();
+
+                // 重建世界（指令传送/读档）后 _lastDepth 会归 -1：
+                // 这时也要按“刚进入该层”处理，否则深处会一直没有加载音乐。
+                if (_lastDepth < 0)
+                {
+                    if (d > 1)
+                    {
+                        _inMapTaken.Remove(d);
+                        _inMapFailBackoff = -999f;
+                        if (!ShouldSkipWaiting(d))
+                        {
+                            int vv = Mathf.Clamp(d - 1, 1, EventDef.Get(MusicEvent.WaitingMap).Files.Length - 1);
+                            PlayEvent(MusicEvent.WaitingMap, vv, "进入已有世界（biomeDepth=" + d + "）");
+                        }
+                    }
+                    _lastDepth = d;
+                    return;
+                }
+
+                if (_lastDepth >= 0 && d != _lastDepth)
+                {
+                    // 换层（含指令传送）时允许这一层重新播一次“进入地图音乐”
+                    _inMapTaken.Remove(d);
+                    _inMapFailBackoff = -999f;
+                    if (!ShouldSkipWaiting(d))
+                    {
+                        int variant = d <= 1 ? 0
+                            : Mathf.Clamp(d - 1, 1, EventDef.Get(MusicEvent.WaitingMap).Files.Length - 1);
+                        PlayEvent(MusicEvent.WaitingMap, variant, "层变化（biomeDepth=" + d + "）");
+                    }
+                    Log.Info("检测到层级变化：" + _lastDepth + " -> " + d);
+                }
+                _lastDepth = d;
+            }
+            catch (Exception ex) { Log.Warn("层级变化检测失败：" + ex.Message); }
+        }
         private float _nextInMapDiag;
         private static FieldInfo _loadingObjectField;
 
@@ -1219,31 +1473,26 @@ namespace UCMB
                 WorldGeneration w = WorldGeneration.world;
                 if (w == null) return false;
 
-                // 加载界面还开着就绝不切 in_map：
-                // 否则 waiting_map（加载地图音乐）刚响就被打断，听感就是两首在抢。
-                // 12 秒后强制放行，防止 loadingObject 因流程差异一直不关闭。
-                bool loading = false;
-                try
+                // ① 世界还在生成：绝不播 in_map
+                if (w.generatingWorld) return false;
+
+                // ② 加载界面还开着：视为还没进入地图。
+                //    之前这里用“进世界 N 秒”强制放行，结果 in_map 在等待界面就响了，
+                //    随后被 waiting_map 打断，进图后反而不再播。
+                if (IsLoadingScreenVisible())
                 {
-                    if (_loadingObjectField == null)
-                        _loadingObjectField = AccessTools.Field(typeof(WorldGeneration), "loadingObject");
-                    if (_loadingObjectField != null)
-                    {
-                        GameObject lo = _loadingObjectField.GetValue(w) as GameObject;
-                        loading = lo != null && lo.activeInHierarchy;
-                    }
+                    // 仅在明显卡住（生成早已结束、加载界面 >10 秒还没关）时才放行兜底
+                    bool stuck = w.timeSinceFinishedGeneration > 0f
+                        && w.timeSinceFinishedGeneration < 999f
+                        && _worldSince > 0f
+                        && Time.unscaledTime - _worldSince > 10f;
+                    return stuck;
                 }
-                catch { }
-                if (loading)
-                    return _worldSince > 0f && Time.unscaledTime - _worldSince > 12f;
 
                 if (w.biomeTitle != null && w.biomeTitle.gameObject.activeInHierarchy) return true;
-                // timeSinceFinishedGeneration 的初始占位值是 1000，必须排除，
-                // 否则“刚进图但还没真正生成完”就会被判成已完成（表现为音乐提早）。
-                if (!w.generatingWorld && w.timeSinceFinishedGeneration > 2f
-                    && w.timeSinceFinishedGeneration < 999f) return true;
-                // 兜底：进世界 8 秒（不依赖 generatingWorld 标志）
-                if (_worldSince > 0f && Time.unscaledTime - _worldSince > 6f) return true;
+                // timeSinceFinishedGeneration 初始占位值是 1000，必须排除
+                if (w.timeSinceFinishedGeneration > 2f && w.timeSinceFinishedGeneration < 999f) return true;
+                if (_worldSince > 0f && Time.unscaledTime - _worldSince > 4f) return true;
             }
             catch { }
             return false;
@@ -1305,6 +1554,15 @@ namespace UCMB
         /// 只压“原版音乐”——战斗主题（currentThreatTheme）与交易主题（索引 16）。
         /// 环境/身体状态类音轨不碰，交还原版自己控制（用户要的是“音乐变闷”，不是环境音）。
         /// </summary>
+        /// <summary>过场/结局类原版音轨：即使选了音乐盒也放行（剧情演出需要）。</summary>
+        internal static bool IsCutsceneClip(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            return name.StartsWith("surfacebreach", StringComparison.OrdinalIgnoreCase)
+                || name.StartsWith("escapeend", StringComparison.OrdinalIgnoreCase)
+                || name.StartsWith("levelup", StringComparison.OrdinalIgnoreCase);
+        }
+
         internal void DuckVanillaDrones()
         {
             try
@@ -1324,8 +1582,19 @@ namespace UCMB
                 {
                     AudioSource s = drones[i];
                     if (s == null || !s.isPlaying) continue;
-                    if (i == threat || i == TradeDroneIndex || i == EarthquakeDroneIndex)
-                        s.volume = 0f;   // 原版音乐：完全压掉
+                    bool isVanillaMusic = i == threat || i == TradeDroneIndex || i == EarthquakeDroneIndex;
+
+                    // 疼痛(0)/濒死(1)/辐射(14) 这几条是“原版情绪音乐”，
+                    // 在对应事件下必须让位，否则会与音乐盒叠在一起（受伤时最明显）。
+                    if (_currentEvent == MusicEvent.AttackHurt && (i == 0 || i == 1)) isVanillaMusic = true;
+                    if (_currentEvent == MusicEvent.Articulos && (i == 0 || i == 1 || i == 14)) isVanillaMusic = true;
+                    if (_currentEvent == MusicEvent.Die && (i == 0 || i == 1)) isVanillaMusic = true;
+
+                    // 暂停：整屏都被暂停界面盖住，此时只应听到 suspend，
+                    // 所有原版 drone（疼痛/水下/辐射/体力…）一律压掉。
+                    if (_currentEvent == MusicEvent.Suspend) isVanillaMusic = true;
+
+                    if (isVanillaMusic) s.volume = 0f;
                 }
             }
             catch (Exception ex) { Log.Error("处理原版 drone 音轨失败：", ex); }
