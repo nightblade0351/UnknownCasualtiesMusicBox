@@ -8,7 +8,7 @@
 参考 CS 音乐盒的事件驱动机制，为《Casualties Unknown》提供「一个音乐盒 + 按事件自动切换曲目」的 BepInEx 5 模组。
 
 - 模组 GUID：`com.everywhere.unknowncasualties.musicbox`
-- 版本：1.3.1
+- 版本：1.3.2
 - 目标框架：.NET Framework 4.7.2（BepInEx 5 / Unity 2022.3.62f3）
 - 依赖：BepInEx 5.4.23.5+、CUCoreLib 1.1（软依赖）
 - 目标游戏版本：Casualties Unknown V1.0.2（本地实测）
