@@ -5,7 +5,7 @@
 >
 > **This content (including the source code itself) contains AI-generated material.**
 
-参考 CS 音乐盒的事件驱动机制，为《Casualties Unknown》提供「一个音乐盒 + 按事件自动切换曲目」的 BepInEx 5 模组。
+**参照 CS 音乐盒制作**：参考 CS 音乐盒的事件驱动机制，为《Casualties Unknown》提供「一个音乐盒 + 按事件自动切换曲目」的 BepInEx 5 模组。
 
 - 模组 GUID：`com.everywhere.unknowncasualties.musicbox`
 - 版本：1.3.2
@@ -47,7 +47,27 @@
 
 3. 启动游戏 → 设置 → 「音频」页 → 选择音乐盒、拖动各事件音量。**选中即生效，无需应用按钮、无需重启。**
 
-## 事件与文件对照
+## 命名规则（对照 CS 音乐盒）
+
+| CS 音乐盒哪个部分 | 游戏哪个部分 | 文件名 | 是否循环 |
+|---|---|---|---|
+| 主界面 | 大厅 / 主菜单 | `hall` | 循环 |
+| 队伍选择 | 角色选择 / 交易 | `choose_part` | 循环 |
+| 行动开始 | 加载地图（第 1 层） | `waiting_map_1` | 不循环 |
+| 回合开始 | 加载地图（第 2 层及以后） | `waiting_map_2`（可选 `_3` / `_4`） | 不循环 |
+| 比赛开始 | 进入地图 / 教程 | `in_map` | 不循环 |
+| 炸弹安放 | 攻击或受伤 | `attack_hurt` | 循环 |
+| 炸弹十秒倒计时 | 濒死 / 辐射线 | `articulos` | 循环 |
+| 死亡视角 | 死亡 / 死亡视角 | `die` | 不循环 |
+| 回合失败 | 结局 1 | `final_result_1` | 不循环 |
+| 回合胜利 | 结局 2 / 击杀长老棘背 | `final_result_2` | 不循环 |
+| MVP | 结局 3 / MVP | `final_result_3` | 不循环 |
+| 比赛结束 | 暂停 / 比赛结束 | `suspend` | 循环 |
+
+> 文件名可带 `_1` / `_2` 后缀做多段随机（如 `waiting_map_1_1.mp3`、`final_result_3_2.mp3`）；
+> 支持 `.mp3` / `.wav` / `.ogg`，不支持 `.flac`。
+
+## 事件与文件对照（触发点细节）
 
 | 事件 | 文件名（无后缀） | 循环 | 触发点（已 IL 确认） |
 |---|---|---|---|
