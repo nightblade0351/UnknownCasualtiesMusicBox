@@ -131,10 +131,10 @@ namespace UCMB
                 if (p == null) return;
                 p.ForceRetrigger = false;
                 p.FirstLoadingPlayed = true;
-                // 不能在这条调用栈里立刻播：此时角色选择界面还没被关掉，
-                // 音乐会在“开始冒险”按钮上响一下再被加载界面接管。
-                // 延迟到加载界面真正出现后（约 0.35 秒）再播。
-                p.PlayEventDelayed(MusicEvent.WaitingMap, 0, 0.35f, "进入加载界面（第一层）");
+                // 这里**不再**播加载音乐：
+                // 联机模组未开主机时 StartRun 也会被调用（然后被拦下），
+                // 只要在这条路径上安排播放，就会出现“没进去却响了”。
+                // 现在统一由“加载界面出现”的边沿触发（Plugin.TrackLoadingEdge）。
             }
             catch (Exception ex) { Log.Error("StartRun 后处理异常：", ex); }
         }
