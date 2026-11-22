@@ -15,7 +15,7 @@ namespace UCMB
     {
         public const string PluginGuid = "com.everywhere.unknowncasualties.musicbox";
         public const string PluginName = "UnknownCasualtiesMusicBox";
-        public const string PluginVersion = "1.3.1";
+        public const string PluginVersion = "1.3.2";
         public const string CUCoreGuid = "net.cucorelib";
 
         internal const string ModIdPrefix = "ucmb.";
@@ -555,24 +555,63 @@ namespace UCMB
         private string _pendingReason;
 
         /// <summary>延迟触发事件：用于“按钮已按下但目标界面还没出现”的场合。</summary>
-        internal void PlayEventDelayed(MusicEvent ev, int variant, float delay, string reason)
+        internal void PlayEventDelayed(MusicEvent ev, int variant, float delay, string reason,
+            bool requireStartRun = false)
         {
             _pendingEvent = ev;
             _pendingVariant = variant;
             _pendingAt = Time.unscaledTime + Mathf.Max(0f, delay);
+            _pendingDeadline = _pendingAt + 3f;   // 最多再等 3 秒，等不到就取消
             _pendingReason = reason;
+            _pendingRequireStartRun = requireStartRun;
             Log.Info("已安排延迟播放 " + ev + "（" + delay.ToString("F2") + "s 后，" + reason + "）");
+        }
+
+        private bool _pendingRequireStartRun;
+        private float _pendingDeadline;
+
+        /// <summary>
+        /// 是否真的进入了加载流程：角色选择/运行设置界面已经关闭。
+        /// 联机模组未开主机时 StartRun 会被拦下，界面不会关闭，这时不该放加载音乐。
+        /// </summary>
+        private static bool StartRunActuallyBegan()
+        {
+            try
+            {
+                // ① 新世界已经开始生成
+                WorldGeneration w = WorldGeneration.world;
+                if (w != null && w.generatingWorld) return true;
+                // ② 加载界面已经出现
+                MusicBoxPlugin p = Instance;
+                if (p != null && p.IsLoadingScreenVisible()) return true;
+                // ③ 角色选择界面已经关闭
+                PreRunScript pr = PreRunScript.instance;
+                if (pr != null && pr.runSettingsScreen != null && !pr.runSettingsScreen.activeSelf) return true;
+                return false;
+            }
+            catch { return false; }
         }
 
         private void TickPendingEvent()
         {
             if (!_pendingEvent.HasValue) return;
             if (Time.unscaledTime < _pendingAt) return;
+            if (_pendingRequireStartRun && !StartRunActuallyBegan())
+            {
+                // 条件还没满足：先等（正常开局每个信号都可能晚半帧出现）
+                if (Time.unscaledTime < _pendingDeadline) return;
+                Log.Info("取消延迟播放：等不到“开始加载”信号（可能是联机未开主机等原因，未真正开始加载）");
+                _pendingEvent = null;
+                _pendingReason = null;
+                _pendingRequireStartRun = false;
+                return;
+            }
             MusicEvent ev = _pendingEvent.Value;
             int variant = _pendingVariant;
             string reason = _pendingReason;
             _pendingEvent = null;
             _pendingReason = null;
+            _pendingRequireStartRun = false;
             PlayEvent(ev, variant, reason);
         }
 
@@ -812,7 +851,13 @@ namespace UCMB
                 // 进入地图音乐：只要成功播过一次，就把本层标记为“已被本模组接管”，
                 // 这样原版层 BGM 不会再插进来，同时避免同一次进图被 PlaySong / PlayLayerSong
                 // 两条路径各播一遍（后者会把前者从头打断）。
-                if (ev == MusicEvent.InMap) MarkInMapTaken(CurrentDepth());
+                if (ev == MusicEvent.InMap)
+                {
+                    MarkInMapTaken(CurrentDepth());
+                    // 进图后的 8 秒独占期：这段刚进地图时异常多（入水、边缘敌人、辐射读数），
+                    // 不设保护会被 attack_hurt 反复打断，听起来就是 in_map 被“顶掉”。
+                    _inMapGuardUntil = Time.unscaledTime + 8f;
+                }
                 if (ev == MusicEvent.WaitingMap)
                 {
                     _lastWaitingAt = Time.unscaledTime;
@@ -938,6 +983,17 @@ namespace UCMB
                     EventDef cur = EventDef.Get(_currentEvent.Value);
                     if (!desired.HasValue) return;
                     EventDef next = EventDef.Get(desired.Value);
+
+                    // in_map 的 8 秒独占期：刚进图的入水/边缘敌人/辐射读数会误触发战斗音乐，
+                    // 这段内一律不让它把 in_map 顶掉。
+                    if (_currentEvent.Value == MusicEvent.InMap && desired.Value != MusicEvent.InMap
+                        && InMapGuardActive)
+                    {
+                        Log.Throttled("inmap_guard", 3f,
+                            "in_map 独占期内忽略 " + desired.Value);
+                        return;
+                    }
+
                     if (cur != null && next != null && next.Priority <= cur.Priority)
                     {
                         // 交易界面是强交互态，进入时要立刻切音乐，不能等 in_map 播完
@@ -1187,6 +1243,18 @@ namespace UCMB
             try
             {
                 bool loading = IsLoadingScreenVisible();
+                if (!_lastLoadingVisible && loading)
+                {
+                    // 加载界面刚出现 = 真的开始加载了。用这条边沿驱动“等待地图音乐”，
+                    // 不再依赖 StartRun（联机未开主机时 StartRun 会被拦，界面不会出现）。
+                    int d = CurrentDepth();
+                    int variant = d <= 1 ? 0
+                        : Mathf.Clamp(d - 1, 1, EventDef.Get(MusicEvent.WaitingMap).Files.Length - 1);
+                    if (!ShouldSkipWaiting(d))
+                    {
+                        PlayEvent(MusicEvent.WaitingMap, variant, "加载界面出现（biomeDepth=" + d + "）");
+                    }
+                }
                 if (_lastLoadingVisible && !loading)
                 {
                     int d = CurrentDepth();
@@ -1334,12 +1402,23 @@ namespace UCMB
                 // 此时身体/敌人刚初始化，threatMusicTime、疼痛值都会出现瞬时跳变，
                 // 会把刚响起的加载音乐当成“低优先级一次性音乐”直接打断。
                 if (WorldGeneration.world.generatingWorld) return false;
+
                 // 只认“真的挨打/真的被怪盯上”，避免长期高疼痛值或残留辐射读数导致
                 // 没有战斗也在放战斗音乐（例如靠近尸体时的环境音）。
-                if (Time.unscaledTime - LastDamageTime < 4f) return true;       // 刚受伤
-                if (PlayerCamera.main != null && PlayerCamera.main.threatMusicTime > 0f) return true; // 原版威胁音乐
-                if (PainSpikeDetected(b)) return true;                          // 疼痛突发（挨打/中机关）
-                if (WorldGeneration.world.earthquakeIntensity > 0.05f) return true; // 地震
+                string src = null;
+                if (Time.unscaledTime - LastDamageTime < 4f) src = "刚受伤";
+                else if (PlayerCamera.main != null && PlayerCamera.main.threatMusicTime > 0f)
+                    src = "原版威胁音乐(threat=" + PlayerCamera.main.threatMusicTime.ToString("F1") + ")";
+                else if (PainSpikeDetected(b))
+                    src = "疼痛骤增(pain=" + b.averagePain.ToString("F1") + ")";
+                else if (WorldGeneration.world.earthquakeIntensity > 0.05f)
+                    src = "地震(" + WorldGeneration.world.earthquakeIntensity.ToString("F2") + ")";
+
+                if (src != null)
+                {
+                    Log.Throttled("attack_hurt_src", 3f, "attack_hurt 触发源：" + src);
+                    return true;
+                }
             }
             catch (Exception ex) { Log.Error("攻击/受伤状态判定异常：", ex); }
             return false;
@@ -1360,6 +1439,13 @@ namespace UCMB
         private float _lastWaitingAt = -999f;
         private int _lastWaitingDepth = int.MinValue;
         private float _waitingGuardUntil = -999f;
+        private float _inMapGuardUntil = -999f;
+
+        /// <summary>in_map 播放后的一小段独占期，避免刚进图就被战斗音乐顶掉。</summary>
+        internal bool InMapGuardActive
+        {
+            get { return Time.unscaledTime < _inMapGuardUntil; }
+        }
 
         /// <summary>加载音乐刚开始播时给它一段独占期，避免 in_map 立刻抢走。</summary>
         internal bool WaitingGuardActive
