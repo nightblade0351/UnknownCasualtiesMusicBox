@@ -15,11 +15,17 @@ namespace UCMB
     {
         public const string PluginGuid = "com.everywhere.unknowncasualties.musicbox";
         public const string PluginName = "UnknownCasualtiesMusicBox";
-        public const string PluginVersion = "1.3.2";
+        public const string PluginVersion = "1.3.3";
         public const string CUCoreGuid = "net.cucorelib";
 
         internal const string ModIdPrefix = "ucmb.";
         internal const string DataFolderName = PluginName;
+
+        /// <summary>
+        /// 加载地图音乐「第二层及以后」随机池的上限编号：waiting_map_2 … waiting_map_12。
+        /// 文件名里不再叠段号，靠这里的编号区分不同曲目。
+        /// </summary>
+        internal const int WaitingPoolMax = 12;
 
         internal static MusicBoxPlugin Instance;
 
@@ -802,6 +808,13 @@ namespace UCMB
                 EventDef def = EventDef.Get(ev);
                 if (def == null) return false;
 
+                // 濒死音乐分两段：
+                //   articulos   = 辐射线出现
+                //   articulos_2 = 濒死
+                // variant < 0 时按当前状态自动选；只有一个 articulos 时下面的回退链会共用它。
+                if (ev == MusicEvent.Articulos && variant < 0)
+                    variant = IsRadiatingNow() ? 0 : 1;
+
                 string fileName = def.Files[(variant >= 0 && variant < def.Files.Length) ? variant : 0];
                 // 一次性音乐正在播放时，忽略重复触发。
                 // 原版在结局分支里会反复 PlaySong(同一 clip)，仅靠 3 秒窗口不够，
@@ -811,27 +824,69 @@ namespace UCMB
                 {
                     return true;   // 视为已接管，保持当前播放
                 }
-                // 一次性音乐的防重：同事件同文件在 3 秒内被再次触发时不再重播。
-                // 例如第一层加载可能同时被 StartRun 与 RegenerateWorld 触发。
-                if (def.OneShot && _lastOneShotEvent == ev && _lastOneShotFile == fileName
-                    && Time.unscaledTime - _lastOneShotAt < 3f)
-                {
-                    Log.Throttled("dup_" + ev, 5f, "跳过重复的一次性音乐 " + ev + "（" + fileName + "），距上次 "
-                        + (Time.unscaledTime - _lastOneShotAt).ToString("F2") + "s");
-                    return true;   // 视为已接管，避免原版插进来
-                }
-                // 多文件事件（如 waiting_map_1..4）从当前层级往下回退：
-                // 第 4 层缺 waiting_map_4 时用 _3，再缺用 _2，最后用 _1。
                 string why = null;
                 string path = null;
-                int startVariant = (variant >= 0 && variant < def.Files.Length) ? variant : 0;
-                for (int v = startVariant; v >= 0; v--)
+
+                if (ev == MusicEvent.WaitingMap)
                 {
-                    fileName = def.Files[v];
-                    path = Library.ResolveFile(_box, fileName, out why);
-                    if (path != null) break;
+                    // ---- 加载地图界面音乐 ----
+                    // 规则（与命名文档一致）：
+                    //   waiting_map_1        = 第一层专属，固定这一首
+                    //   waiting_map_2..N     = 第二层及以后的随机池，每次加载随机抽一首
+                    // 这样文件名里不会再出现 waiting_map_1_1 这种“两个数字”的情况。
+                    bool usePool = variant >= 1 || (variant < 0 && CurrentDepth() > 1);
+                    if (!usePool)
+                    {
+                        path = Library.ResolveFile(_box, "waiting_map_1", out why);
+                        if (path != null) fileName = "waiting_map_1";
+                        else usePool = true;      // 第一层没专属曲目 → 借用第二层池兜底
+                    }
+                    if (usePool)
+                    {
+                        string picked;
+                        path = Library.ResolveRandomVariant(_box, "waiting_map", 2,
+                            WaitingPoolMax, out picked, out why);
+                        if (path != null) fileName = picked;
+                        else
+                        {
+                            // 池里一首都没有 → 退回第一层那首
+                            path = Library.ResolveFile(_box, "waiting_map_1", out why);
+                            if (path != null) fileName = "waiting_map_1";
+                        }
+                    }
+                    if (path == null) { Library.LogMissingOnce(_box, "waiting_map", why); return false; }
                 }
-                if (path == null) { Library.LogMissingOnce(_box, def.Files[0], why); return false; }
+                else
+                {
+                    // 一次性音乐的防重：同事件同文件在 3 秒内被再次触发时不再重播。
+                    // 例如第一层加载可能同时被 StartRun 与 RegenerateWorld 触发。
+                    if (def.OneShot && _lastOneShotEvent == ev && _lastOneShotFile == fileName
+                        && Time.unscaledTime - _lastOneShotAt < 3f)
+                    {
+                        Log.Throttled("dup_" + ev, 5f, "跳过重复的一次性音乐 " + ev + "（" + fileName + "），距上次 "
+                            + (Time.unscaledTime - _lastOneShotAt).ToString("F2") + "s");
+                        return true;   // 视为已接管，避免原版插进来
+                    }
+                    // 多文件事件（如 articulos / articulos_2）从首选位往下回退：
+                    int startVariant = (variant >= 0 && variant < def.Files.Length) ? variant : 0;
+                    for (int v = startVariant; v >= 0; v--)
+                    {
+                        fileName = def.Files[v];
+                        path = Library.ResolveFile(_box, fileName, out why);
+                        if (path != null) break;
+                    }
+                    if (path == null)
+                    {
+                        // 首选缺失时向上补（例如只有 articulos_2 时，辐射线场景也能用它）
+                        for (int v = startVariant + 1; v < def.Files.Length; v++)
+                        {
+                            fileName = def.Files[v];
+                            path = Library.ResolveFile(_box, fileName, out why);
+                            if (path != null) break;
+                        }
+                    }
+                    if (path == null) { Library.LogMissingOnce(_box, def.Files[0], why); return false; }
+                }
                 AudioClip clip = Library.LoadClip(path);
                 if (clip == null) return false;
 
@@ -937,6 +992,8 @@ namespace UCMB
                 TrackWorldDwell();
                 TrackDepthChange();
                 TrackLoadingEdge();
+                TrackWorldEdge();
+                SuppressVanillaMenuMusic();
 
 #if SELFTEST
                 DiagState();
@@ -1076,7 +1133,7 @@ namespace UCMB
                 RestoreVanillaMenuMusic();
                 return;
             }
-            if (PlayEvent(desired.Value, 0, reason)) return;
+            if (PlayEvent(desired.Value, -1, reason)) return;   // -1 = 由事件自行决定分段
 
             // 播放失败（例如缺文件）：给 3 秒退避，避免每帧重试；
             // 成功路径不设退避，否则会与状态去抖互相锁死（一直判定 InMap 但永远不被采纳）。
@@ -1090,15 +1147,97 @@ namespace UCMB
             RestoreVanillaMenuMusic();
         }
 
+        /// <summary>
+        /// 菜单场景下持续压制原版菜单音乐。
+        ///
+        /// 之前只在“切到 hall / choose_part 的那一刻”Stop 一次，问题是：
+        /// 联机模组返回主菜单/回大厅时会重载菜单场景，<c>PreRunScript.Start()</c>
+        /// 会把 <c>menuSource</c> 重新 Play 起来；而此时状态机认为
+        /// “当前事件 == desired 且本模组音乐还在响”，直接 return，不会再去 Stop，
+        /// 于是原版菜单音乐就和音乐盒音乐叠在一起——正是“有时莫名其妙插进来一段原版音乐”。
+        ///
+        /// 这里改成每帧兜底：只要本模组的菜单音乐在响、且玩家选了音乐盒，就把原版菜单音源停掉。
+        /// 选择“游戏默认”（_box 为空）时完全不干预。
+        /// </summary>
+        internal void SuppressVanillaMenuMusic()
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(_box)) return;   // 游戏默认：保持原版
+                if (InWorld()) return;
+                if (Engine == null) return;
+                // 只要音乐盒还有任意一首在出声（包括刚从世界回菜单时还没播完的 in_map），
+                // 就把原版菜单音乐压掉。之前只看 hall/choose_part，
+                // 于是“点退出回主菜单”时原版菜单音乐会和 in_map 一起响。
+                if (!Engine.AnyAudible()) return;
+                PreRunScript pr = PreRunScript.instance;
+                if (pr == null) return;
+                AudioSource ms = pr.menuSource;
+                if (ms == null || !ms.isPlaying) return;
+                ms.Stop();
+                Log.Throttled("menu_vanilla_stop", 5f,
+                    "压制原版菜单音乐（场景重载后原版会重新开播，避免与音乐盒叠加）");
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 切回“游戏默认”时，让原版菜单音乐重新开始。
+        /// 只在玩家确实选择“游戏默认”时调用；选了音乐盒但缺文件时保持安静，
+        /// 避免“缺文件 → 原版插进来”这种观感。
+        /// </summary>
         private static void RestoreVanillaMenuMusic()
         {
             try
             {
+                MusicBoxPlugin p = Instance;
+                if (p != null && !string.IsNullOrEmpty(p._box)) return;
                 PreRunScript pr = PreRunScript.instance;
                 if (pr == null || pr.menuSource == null) return;
                 if (pr.menuSource.clip != null && !pr.menuSource.isPlaying) pr.menuSource.Play();
             }
             catch { }
+        }
+
+        // ---- 联机模组把「选择角色」拆成独立面板后的状态探测 ----
+        // 联机模组（Together / CasualtiesMP）会用 Together.LobbyCharacterPanel 替换原版
+        // 角色选择界面；此时 PreRunScript.runSettingsScreen 可能处于 inactive，
+        // 只按它判断就会误判成“大厅”，从而切错音乐。
+        private static FieldInfo _mpPanelInstanceField;
+        private static FieldInfo _mpPanelShownField;
+        private static float _mpPanelProbeAt;
+        private static bool _mpPanelResolved;
+
+        private static bool IsMpLobbyChoosing()
+        {
+            try
+            {
+                if (!_mpPanelResolved)
+                {
+                    if (Time.unscaledTime < _mpPanelProbeAt) return false;
+                    _mpPanelProbeAt = Time.unscaledTime + 1f;
+                    Type type = null;
+                    Assembly[] asms = AppDomain.CurrentDomain.GetAssemblies();
+                    for (int i = 0; i < asms.Length; i++)
+                    {
+                        try { type = asms[i].GetType("Together.LobbyCharacterPanel", false); }
+                        catch { type = null; }
+                        if (type != null) break;
+                    }
+                    if (type == null) return false;   // 联机模组没装/还没加载：稍后重试
+                    _mpPanelInstanceField = type.GetField("instance",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                    _mpPanelShownField = type.GetField("shown",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    _mpPanelResolved = _mpPanelInstanceField != null && _mpPanelShownField != null;
+                    if (!_mpPanelResolved) return false;
+                }
+                object inst = _mpPanelInstanceField.GetValue(null);
+                if (inst == null) return false;
+                object shown = _mpPanelShownField.GetValue(inst);
+                return shown is bool && (bool)shown;
+            }
+            catch { return false; }
         }
 
         private MusicEvent? ResolveDesired()
@@ -1144,6 +1283,9 @@ namespace UCMB
             {
                 GameObject rs = pr.runSettingsScreen;
                 bool choosing = rs != null && rs.activeSelf;
+                // 联机模组把角色选择拆成独立面板（Together.LobbyCharacterPanel）时，
+                // runSettingsScreen 可能是 inactive，但玩家其实正在选角色。
+                if (!choosing && IsMpLobbyChoosing()) choosing = true;
                 LogMenuState(pr, rs, choosing);
                 if (choosing) return MusicEvent.ChoosePart;
                 return MusicEvent.Hall;
@@ -1165,7 +1307,8 @@ namespace UCMB
             {
                 detail = " runSettingsScreen='"
                     + (rs == null ? "(null)" : rs.name) + "'"
-                    + " menuSourcePlaying=" + (pr.menuSource != null && pr.menuSource.isPlaying);
+                    + " menuSourcePlaying=" + (pr.menuSource != null && pr.menuSource.isPlaying)
+                    + " mpLobbyChoosing=" + IsMpLobbyChoosing();
             }
             catch { }
             Log.Info("菜单状态：" + now + detail);
@@ -1178,7 +1321,7 @@ namespace UCMB
                 if (PauseHandler.main == null) return false;
                 if (WorldGeneration.world == null) return false;   // 菜单场景无真暂停
                 // 必须真的进入暂停（淡入完成），避免暂停动画中途或状态残留导致暂停音乐误播
-                if (PauseHandler.main.isPaused && PauseHandler.main.pauseProgress > 0.5f) return true;
+                if (PauseHandler.main.isPaused && PauseHandler.main.pauseProgress > 0.1f) return true;
 
                 // 打开设置页时，暂停本身没被解除；这里要让“暂停音乐”继续播，
                 // 否则一进设置页就会判定成“不在暂停”，suspend 被淡出（表现为点设置后音乐停）。
@@ -1235,6 +1378,51 @@ namespace UCMB
         private float _pauseFade = 1f;
         private bool _lastLoadingVisible;
 
+        private bool _lastInWorld;
+
+        /// <summary>
+        /// 世界 ⇄ 菜单 的切换边沿。
+        ///
+        /// 从世界退回主菜单时（游戏内点「退出」/联机返回大厅），游戏会重载菜单场景，
+        /// <c>PreRunScript.Start()</c> 重新播放原版菜单音乐；而本模组的 in_map 一次性音乐
+        /// 因为优先级 31 &gt; 大厅 10，还会继续放着——于是两者叠在一起，
+        /// 等 in_map 播完才轮到大厅音乐，听起来就是“原版音乐被大厅音乐顶掉”。
+        ///
+        /// 修法：跨出世界的那一刻把世界内的事件状态全部作废（音频交给 FadeOutAll 淡出），
+        /// 让大厅/角色选择音乐立刻接管，同时顺手停掉原版菜单音源。
+        /// </summary>
+        private void TrackWorldEdge()
+        {
+            try
+            {
+                bool now = InWorld();
+                if (now) { _lastInWorld = true; _outOfWorldSince = -1f; return; }
+                if (!_lastInWorld) return;                        // 本来就在菜单
+                if (PreRunScript.instance == null) return;         // 菜单场景还没加载出来（层间切换的空档）
+                if (_outOfWorldSince < 0f) _outOfWorldSince = Time.unscaledTime;
+                // 防抖：层间重新生成时也可能短暂丢失 world/camera，别把它当成“回菜单”
+                if (Time.unscaledTime - _outOfWorldSince < 0.3f) return;
+
+                Log.Info("已离开世界（回到菜单）：重置世界内事件状态，交给主菜单音乐接管");
+                _currentEvent = null;
+                _currentIsOneShot = false;
+                _inMapTaken.Clear();
+                _waitingGuardUntil = -999f;
+                _inMapGuardUntil = -999f;
+                _inMapFailBackoff = -999f;
+                _lastDepth = -1;
+                _pauseActive = false;
+                _lastMenuState = null;
+                PreRunScript pr = PreRunScript.instance;
+                if (pr != null && pr.menuSource != null && pr.menuSource.isPlaying) pr.menuSource.Stop();
+                _lastInWorld = false;
+                _outOfWorldSince = -1f;
+            }
+            catch { }
+        }
+
+        private float _outOfWorldSince = -1f;
+
         /// <summary>
         /// 加载界面关闭的那一刻：重置本层的 in_map 标记，确保“进入地图音乐”一定播一次。
         /// </summary>
@@ -1248,8 +1436,8 @@ namespace UCMB
                     // 加载界面刚出现 = 真的开始加载了。用这条边沿驱动“等待地图音乐”，
                     // 不再依赖 StartRun（联机未开主机时 StartRun 会被拦，界面不会出现）。
                     int d = CurrentDepth();
-                    int variant = d <= 1 ? 0
-                        : Mathf.Clamp(d - 1, 1, EventDef.Get(MusicEvent.WaitingMap).Files.Length - 1);
+                    // 第一层固定 waiting_map_1；第二层及以后由 PlayEvent 在随机池里抽
+                    int variant = d <= 1 ? 0 : -1;
                     if (!ShouldSkipWaiting(d))
                     {
                         PlayEvent(MusicEvent.WaitingMap, variant, "加载界面出现（biomeDepth=" + d + "）");
@@ -1406,7 +1594,11 @@ namespace UCMB
                 // 只认“真的挨打/真的被怪盯上”，避免长期高疼痛值或残留辐射读数导致
                 // 没有战斗也在放战斗音乐（例如靠近尸体时的环境音）。
                 string src = null;
-                if (Time.unscaledTime - LastDamageTime < 4f) src = "刚受伤";
+                if (Time.unscaledTime - LastDamageTime < 8f) src = "刚受伤";
+                // 泡在液体里：溺水伤害是间歇性的（有时十几秒才掉一次血），
+                // 只靠“刚受伤”窗口会出现“放一段→淡出→过一会又从头放”。
+                // Body.inWater 只要还在液体里就是 true，能保证这一段音乐连续。
+                else if (b.inWater) src = "在液体中";
                 else if (PlayerCamera.main != null && PlayerCamera.main.threatMusicTime > 0f)
                     src = "原版威胁音乐(threat=" + PlayerCamera.main.threatMusicTime.ToString("F1") + ")";
                 else if (PainSpikeDetected(b))
@@ -1416,13 +1608,18 @@ namespace UCMB
 
                 if (src != null)
                 {
+                    // 退出保持：战斗/受伤这类状态在边界会抖，短空档不该让音乐淡出重来
+                    _hurtHoldUntil = Time.unscaledTime + 4f;
                     Log.Throttled("attack_hurt_src", 3f, "attack_hurt 触发源：" + src);
                     return true;
                 }
+                if (Time.unscaledTime < _hurtHoldUntil) return true;
             }
             catch (Exception ex) { Log.Error("攻击/受伤状态判定异常：", ex); }
             return false;
         }
+
+        private float _hurtHoldUntil = -999f;
 
         private static bool IsTrading()
         {
@@ -1484,8 +1681,7 @@ namespace UCMB
                         _inMapFailBackoff = -999f;
                         if (!ShouldSkipWaiting(d))
                         {
-                            int vv = Mathf.Clamp(d - 1, 1, EventDef.Get(MusicEvent.WaitingMap).Files.Length - 1);
-                            PlayEvent(MusicEvent.WaitingMap, vv, "进入已有世界（biomeDepth=" + d + "）");
+                            PlayEvent(MusicEvent.WaitingMap, -1, "进入已有世界（biomeDepth=" + d + "）");
                         }
                     }
                     _lastDepth = d;
@@ -1499,9 +1695,7 @@ namespace UCMB
                     _inMapFailBackoff = -999f;
                     if (!ShouldSkipWaiting(d))
                     {
-                        int variant = d <= 1 ? 0
-                            : Mathf.Clamp(d - 1, 1, EventDef.Get(MusicEvent.WaitingMap).Files.Length - 1);
-                        PlayEvent(MusicEvent.WaitingMap, variant, "层变化（biomeDepth=" + d + "）");
+                        PlayEvent(MusicEvent.WaitingMap, d <= 1 ? 0 : -1, "层变化（biomeDepth=" + d + "）");
                     }
                     Log.Info("检测到层级变化：" + _lastDepth + " -> " + d);
                 }
@@ -1611,6 +1805,20 @@ namespace UCMB
             }
             catch (Exception ex) { Log.Error("濒死状态判定异常：", ex); }
             return false;
+        }
+
+        /// <summary>辐射线是否正在接近（用于区分 articulos / articulos_2 两段）。</summary>
+        private static bool IsRadiatingNow()
+        {
+            try
+            {
+                Body b = LocalBody();
+                if (b == null) return false;
+                if (RadiationLine.line == null || !RadiationLine.line.active) return false;
+                float dy = Mathf.Abs(RadiationLine.line.transform.position.y - b.transform.position.y);
+                return dy < 75f;
+            }
+            catch { return false; }
         }
 
         private bool PainSpikeDetected(Body b)
