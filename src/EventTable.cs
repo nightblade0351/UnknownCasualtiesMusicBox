@@ -60,8 +60,11 @@ namespace UCMB
                 new string[] { "choose_part" }, true, 20, false),
 
             new EventDef(MusicEvent.WaitingMap, "waiting_map", "加载地图界面音乐",
-                "第一层读取 waiting_map_1（行动开始），第二层起依次尝试 waiting_map_2 / _3 / _4（回合开始），缺失则回退上一级；全部共用这一项设置与音量。不循环。",
-                new string[] { "waiting_map_1", "waiting_map_2", "waiting_map_3", "waiting_map_4" },
+                "第一层固定 waiting_map_1（行动开始）；第二层及以后从 waiting_map_2 … waiting_map_12 里随机抽一首（回合开始）。"
+                + "文件名不再叠加段号，共用这一项设置与音量。不循环。",
+                new string[] { "waiting_map_1", "waiting_map_2", "waiting_map_3", "waiting_map_4",
+                               "waiting_map_5", "waiting_map_6", "waiting_map_7", "waiting_map_8",
+                               "waiting_map_9", "waiting_map_10", "waiting_map_11", "waiting_map_12" },
                 false, 30, true),
 
             new EventDef(MusicEvent.InMap, "in_map", "进入地图音乐",
@@ -73,8 +76,8 @@ namespace UCMB
                 new string[] { "attack_hurt" }, true, 50, false),
 
             new EventDef(MusicEvent.Articulos, "articulos", "濒死音乐",
-                "多人游戏中他人到达底部、辐射线出现，或自身濒临死亡时循环（炸弹十秒倒计时语义）。",
-                new string[] { "articulos" }, true, 60, false),
+                "辐射线出现时读 articulos，濒死（含多人濒死）时读 articulos_2；只放一个 articulos 时两者共用。循环。",
+                new string[] { "articulos", "articulos_2" }, true, 60, false),
 
             new EventDef(MusicEvent.Suspend, "suspend", "暂停音乐",
                 "角色暂停 / 比赛结束时循环（比赛结束语义）。",
