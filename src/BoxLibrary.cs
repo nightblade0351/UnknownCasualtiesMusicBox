@@ -245,6 +245,9 @@ namespace UCMB
                     Log.Warn("音频加载失败：" + path);
                     return null;
                 }
+                // 裁掉结尾“完全无声音”的空白段：
+                // 循环曲不再每圈多静一段，一次性曲播到人声/旋律结束就停。
+                clip = TrimTailSilence(clip, path);
                 _clipCache[path] = clip;
                 return clip;
             }
@@ -255,11 +258,148 @@ namespace UCMB
             }
         }
 
+        /// <summary>
+        /// 在一组「同前缀 + 编号」的文件里随机取一首（例如 waiting_map_2 … waiting_map_12）。
+        /// 命中后通过 <paramref name="pickedBase"/> 返回实际使用的基础名，便于日志与防重。
+        /// </summary>
+        public string ResolveRandomVariant(string boxName, string prefix, int from, int to,
+            out string pickedBase, out string reason)
+        {
+            pickedBase = null;
+            reason = null;
+            List<string> hits = new List<string>();
+            List<string> bases = new List<string>();
+            // 官方约定是 from..to（waiting_map_2 … _12）；
+            // 但玩家可能手工加到 13、14…，所以 to 之后再多探 3 个空号，
+            // 连续 3 个空号才认为池子到头。这样既不会被多余文件干扰也很宽容。
+            int hardCap = Math.Max(to, from) + 32;
+            int missStreak = 0;
+            for (int v = from; v <= hardCap; v++)
+            {
+                string baseName = prefix + "_" + v.ToString();
+                string why;
+                string p = ResolveFile(boxName, baseName, out why);
+                if (p != null) { hits.Add(p); bases.Add(baseName); missStreak = 0; continue; }
+                if (v >= to)
+                {
+                    missStreak++;
+                    if (missStreak >= 3) break;
+                }
+            }
+            if (hits.Count == 0)
+            {
+                reason = "缺少 " + prefix + "_" + from + " … " + prefix + "_" + to + ".mp3/.wav/.ogg";
+                return null;
+            }
+            int idx = 0;
+            if (hits.Count > 1)
+            {
+                idx = UnityEngine.Random.Range(0, hits.Count);
+                Log.Info("加载音乐随机池：" + string.Join(" / ", bases.ToArray())
+                    + " → 选中 " + Path.GetFileName(hits[idx]));
+            }
+            pickedBase = bases[idx];
+            return hits[idx];
+        }
+
         public void LogMissingOnce(string boxName, string fileBaseName, string reason)
         {
             string key = boxName + "|" + fileBaseName;
             if (!_loggedMissing.Add(key)) return;
             Log.Warn("事件音频不可用（" + boxName + " / " + fileBaseName + "）：" + reason + "，本次回退游戏默认行为。");
+        }
+
+        // ---- 结尾静音裁剪 ----
+        // 判定为“完全无声音”的阈值：约 -62 dBFS。低于它的样本视为静音，
+        // 这样能吃掉数字静音/极低底噪，又不会把真实尾音（混响、淡出）切掉。
+        private const float TailSilenceThreshold = 0.0008f;
+        // 至少 0.5 秒的静音尾巴才值得裁，避免把正常的呼吸间隙也剪掉。
+        private const float TailMinSeconds = 0.5f;
+        // 保留一点点余量，防止在波形刚好归零的那一帧硬切产生“咔”声。
+        private const float TailMarginSeconds = 0.08f;
+
+        /// <summary>
+        /// 把音频结尾的静音段裁掉，返回**新的** AudioClip（原 clip 不再使用）。
+        ///
+        /// 为什么在加载时裁而不是播放时跳：
+        ///   - 循环音乐交给 Unity 原生 loop，循环区间就是 [0, 裁后长度)，
+        ///     不会出现“每圈末尾静 2 秒”，也不需要自己做“跳回 0”的状态机，
+        ///     因此与循环/淡入淡出/独占期完全不冲突；
+        ///   - 一次性音乐（die / 结局 / 加载 / 进图）播到裁后长度就自然结束，
+        ///     听感上就是“音乐一停马上接下一个事件”，不会干等静音。
+        ///
+        /// 任何异常都会原样返回原 clip，不影响播放。
+        /// </summary>
+        private static AudioClip TrimTailSilence(AudioClip clip, string path)
+        {
+            try
+            {
+                int ch = clip.channels;
+                int freq = clip.frequency;
+                int total = clip.samples;          // 每声道帧数
+                if (ch <= 0 || freq <= 0 || total <= freq) return clip;   // 太短，不处理
+
+                const int ChunkFrames = 32768;
+                int endFrame = total;              // 独占式：有效内容结束位置
+                bool foundSound = false;
+
+                while (endFrame > 0)
+                {
+                    int frames = Math.Min(ChunkFrames, endFrame);
+                    int start = endFrame - frames;
+                    float[] buf = new float[frames * ch];
+                    if (!clip.GetData(buf, start)) return clip;   // 平台不支持取样本：放弃裁剪
+                    for (int f = frames - 1; f >= 0; f--)
+                    {
+                        bool quiet = true;
+                        int baseIdx = f * ch;
+                        for (int c = 0; c < ch; c++)
+                        {
+                            if (Math.Abs(buf[baseIdx + c]) > TailSilenceThreshold) { quiet = false; break; }
+                        }
+                        if (!quiet)
+                        {
+                            endFrame = start + f + 1;
+                            foundSound = true;
+                            break;
+                        }
+                    }
+                    if (foundSound) break;
+                    endFrame = start;
+                }
+
+                if (!foundSound) return clip;      // 整首都是静音：保持原样，交给调用方处理
+
+                float tail = (total - endFrame) / (float)freq;
+                if (tail < TailMinSeconds) return clip;
+
+                int keep = endFrame + Mathf.CeilToInt(TailMarginSeconds * freq);
+                if (keep > total) keep = total;
+                if (keep >= total) return clip;
+                if (keep < freq / 2) return clip;  // 裁完不足半秒，多半是判断误伤，放弃
+
+                AudioClip trimmed = AudioClip.Create(clip.name + "_tailcut", keep, ch, freq, false);
+                if (trimmed == null) return clip;
+
+                // 分块拷贝，避免给几分钟的曲子一次性分配几十 MB 的临时数组。
+                for (int pos = 0; pos < keep; pos += ChunkFrames)
+                {
+                    int n = Math.Min(ChunkFrames, keep - pos);
+                    float[] piece = new float[n * ch];
+                    if (!clip.GetData(piece, pos)) return clip;
+                    if (!trimmed.SetData(piece, pos)) return clip;
+                }
+
+                Log.Info("结尾静音已跳过：" + Path.GetFileName(path)
+                    + " 原长 " + clip.length.ToString("F1") + "s → "
+                    + trimmed.length.ToString("F1") + "s（裁掉 " + tail.ToString("F2") + "s）");
+                return trimmed;
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("结尾静音检测失败（按原样播放）：" + ex.Message);
+                return clip;
+            }
         }
 
         public void ClearClipCache()
