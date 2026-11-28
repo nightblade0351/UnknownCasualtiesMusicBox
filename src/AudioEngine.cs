@@ -188,6 +188,22 @@ namespace UCMB
             return false;
         }
 
+        /// <summary>
+        /// 是否还有任意一首（含正在淡出的）在出声。
+        /// 用于菜单场景判断“音乐盒音乐是否已经接管”，从而决定要不要压掉原版菜单音乐。
+        /// </summary>
+        internal bool AnyAudible()
+        {
+            for (int i = 0; i < _voices.Count; i++)
+            {
+                Voice v = _voices[i];
+                if (v.Source == null) continue;
+                if (!v.Source.isPlaying) continue;
+                if (v.Logical > 0.0005f) return true;
+            }
+            return false;
+        }
+
         internal void SetVolumeForTag(string tag, float volume)
         {
             for (int i = 0; i < _voices.Count; i++)
