@@ -180,12 +180,10 @@ namespace UCMB
                     return;
                 }
 
-                // 第 2 层用 waiting_map_2，第 3 层 _3，第 4 层及以后 _4（缺失时逐级回退）
-                int variant = Mathf.Clamp(depth <= 1 ? 1 : depth - 1, 1,
-                    EventDef.Get(MusicEvent.WaitingMap).Files.Length - 1);
                 if (!p.ShouldSkipWaiting(depth))
                 {
-                    p.PlayEvent(MusicEvent.WaitingMap, variant,
+                    // 第 2 层及以后：由 PlayEvent 在 waiting_map_2…12 里随机取一首
+                    p.PlayEvent(MusicEvent.WaitingMap, -1,
                         "第 2 层及以后（biomeDepth=" + depth + "，第 " + p.RegenCount + " 次生成）");
                 }
                 else
@@ -256,7 +254,7 @@ namespace UCMB
                     Log.Throttled("inmap_taken", 5f, "原版音轨 " + name + " -> in_map 本层已接管，压制原版");
                     return false;
                 }
-                if (p.PlayEvent(ev.Value, 0, "原版音轨 " + name))
+                if (p.PlayEvent(ev.Value, -1, "原版音轨 " + name))
                 {
                     p.FadeOutVanillaMusic();   // 原版不硬停，3 秒淡出，避免叠加与硬切
                     return false;
