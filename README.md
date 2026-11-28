@@ -35,6 +35,7 @@
             choose_part.mp3
             waiting_map_1.mp3
             waiting_map_2.mp3
+            waiting_map_3.mp3   （可选，第二层及以后的随机池）
             in_map.mp3
             attack_hurt.mp3
             articulos.mp3
@@ -54,18 +55,26 @@
 | 主界面 | 大厅 / 主菜单 | `hall` | 循环 |
 | 队伍选择 | 角色选择 / 交易 | `choose_part` | 循环 |
 | 行动开始 | 加载地图（第 1 层） | `waiting_map_1` | 不循环 |
-| 回合开始 | 加载地图（第 2 层及以后） | `waiting_map_2`（可选 `_3` / `_4`） | 不循环 |
+| 回合开始 | 加载地图（第 2 层及以后） | `waiting_map_2` … `waiting_map_12`（随机抽一首） | 不循环 |
 | 比赛开始 | 进入地图 / 教程 | `in_map` | 不循环 |
 | 炸弹安放 | 攻击或受伤 | `attack_hurt` | 循环 |
-| 炸弹十秒倒计时 | 濒死 / 辐射线 | `articulos` | 循环 |
+| 回合十秒倒计时 | 辐射线出现 | `articulos` | 循环 |
+| 炸弹十秒倒计时 | 濒死 | `articulos_2`（缺省时共用 `articulos`） | 循环 |
 | 死亡视角 | 死亡 / 死亡视角 | `die` | 不循环 |
 | 回合失败 | 结局 1 | `final_result_1` | 不循环 |
 | 回合胜利 | 结局 2 / 击杀长老棘背 | `final_result_2` | 不循环 |
 | MVP | 结局 3 / MVP | `final_result_3` | 不循环 |
 | 比赛结束 | 暂停 / 比赛结束 | `suspend` | 循环 |
 
-> 文件名可带 `_1` / `_2` 后缀做多段随机（如 `waiting_map_1_1.mp3`、`final_result_3_2.mp3`）；
+> **加载地图音乐的编号是「槽位」不是「段号」**：`waiting_map_1` 固定给第一层，
+> `waiting_map_2` … `waiting_map_12` 是第二层及以后的随机池。
+> 不要再写 `waiting_map_1_1` 这种「两个数字」的名字。
+> 其他事件需要多首随机时，在基础名后加 `_2` / `_3`（如 `final_result_3_1`、`attack_hurt_2`）。
 > 支持 `.mp3` / `.wav` / `.ogg`，不支持 `.flac`。
+
+**结尾静音自动跳过**：加载时会检测音频结尾的“完全无声音”段（约 −62 dBFS）并裁掉，
+循环曲的循环区间随之变短（不会每圈末尾多静几秒），一次性曲播到音乐结束就停。
+只在内存里裁，不改动 data 里的文件；日志会打印 `结尾静音已跳过：… 原长 182.3s → 176.9s`。
 
 ## 事件与文件对照（触发点细节）
 
@@ -74,10 +83,11 @@
 | 大厅/主菜单 | `hall` | 循环 | 主菜单（`runSettingsScreen` 未激活，含开场封面/警告页） |
 | 角色选择/交易 | `choose_part` | 循环 | `runSettingsScreen` 激活（点“开始游戏”后的角色/运行设置界面）、交易界面 |
 | 加载地图（第一层） | `waiting_map_1` | 不循环 | `PreRunScript.StartRun` |
-| 加载地图（第二层起） | `waiting_map_2` | 不循环 | `WorldGeneration.RegenerateWorld`（`biomeDepth ≥ 2`） |
+| 加载地图（第二层起） | `waiting_map_2` … `waiting_map_12`（随机） | 不循环 | `WorldGeneration.RegenerateWorld`（`biomeDepth ≥ 2`） |
 | 进入地图/教程 | `in_map` | 不循环 | `MusicManager.PlayLayerSong`（层 BGM 起点）、教程 BGM |
 | 攻击或受伤 | `attack_hurt` | 循环 | 真正受伤（受伤音 4 秒内）/ 原版威胁音乐 `threatMusicTime` / 疼痛骤增（>25 且跳变>8） |
-| 濒死/辐射线 | `articulos` | 循环 | `Body.brainDying`、`Body.isDying`，或辐射线高度差<75 |
+| 辐射线出现 | `articulos` | 循环 | 辐射线高度差 < 75 |
+| 濒死 | `articulos_2` | 循环 | `Body.brainDying` / `Body.isDying`；缺 `articulos_2` 时用 `articulos` |
 | 暂停/比赛结束 | `suspend` | 循环 | `PauseHandler.isPaused` 且 `pauseProgress > 0.5`（世界内、设置页未打开） |
 | 死亡视角 | `die` | 不循环 | 原版 `deadClip`、自杀音乐 `whathaveidone` |
 | 结局1（培养罐） | `final_result_1` | 不循环 | `BiopodEnding` / `Alt` / `Alt2` |
@@ -129,7 +139,7 @@ final_result_3 = 100
 ```
 
 - 原生 `settings.json` 也会镜像这 12 个值（`ucmb.box` / `ucmb.vol.<事件>`）；冲突时**以 cfg 为准**。
-- `waiting_map` 一项同时控制 `waiting_map_1` 与 `waiting_map_2`。
+- `waiting_map` 一项同时控制第一层与第二层及以后的随机池。
 - 从 v1.0.0（每事件配置）与 v1.1.0（单一 `Volume`）升级时，会自动迁移并清理旧键。
 
 ## 构建
